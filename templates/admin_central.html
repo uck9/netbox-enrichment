@@ -1,0 +1,161 @@
+<!doctype html>
+<html>
+<head>
+<base href="{{ base_path }}/"> 
+  <meta charset="utf-8">
+  <title>NetBox Enrichment — Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #0b0d10; --card: #14181d; --text: #e6edf3; --muted: #9aa7b2;
+      --accent: #7aa2f7; --border: #263241;
+    }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; }
+    header { padding: 20px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: center; }
+    h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+    main { padding: 20px; display: grid; gap: 16px; grid-template-columns: 1.2fr 2fr; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .k { color: var(--muted); width: 200px; }
+    .grid { display: grid; grid-template-columns: 200px 1fr; gap: 8px 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    select, button { background: #10151b; color: var(--text); border: 1px solid var(--border); padding: 8px 10px; border-radius: 8px; }
+    button.primary { background: var(--accent); color: #081018; border: none; }
+    small.muted { color: var(--muted); }
+    a { color: var(--accent); text-decoration: none; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #0e1520; border: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+    footer { padding: 16px 20px; color: var(--muted); border-top: 1px solid var(--border); }
+    @media (max-width: 1024px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NetBox Enrichment — Admin</h1>
+    <span class="pill" id="env-pill">env</span>
+    <small class="muted" id="now"></small>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2 style="margin-top:0">Service config</h2>
+      <div class="grid" id="config-grid"></div>
+      <div style="margin-top:12px">
+        <button id="refresh-btn" class="primary">Force Cache Refresh</button>
+        <small id="refresh-note" class="muted"></small>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="controls">
+        <h2 style="margin:0">Stats</h2>
+        <span style="flex:1"></span>
+        <label for="days" class="k">Duration</label>
+        <select id="days">
+          <option value="1">1 day</option>
+          <option value="7" selected>7 days</option>
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button id="apply">Apply</button>
+      </div>
+
+      <h3>Top Hits</h3>
+      <table id="hits-table">
+        <thead><tr><th>IP</th><th>Hostname</th><th>Total</th><th>Device</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h3 style="margin-top:18px">Misses (no NetBox match)</h3>
+      <table id="misses-table">
+        <thead><tr><th>IP</th><th>Total</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    NetBox Enrichment — <span id="footer-days">7</span> day window • <span id="footer-env"></span>
+  </footer>
+
+  <script>
+    const fmt = (v) => v === undefined || v === null || v === '' ? '—' : v;
+
+    async function loadConfig() {
+      const res = await fetch('admin/config', { headers: authHeaders() });
+      if (!res.ok) throw new Error('config fetch failed');
+      const data = await res.json();
+
+      document.getElementById('env-pill').textContent = data.environment;
+      document.getElementById('footer-env').textContent = data.environment;
+      document.getElementById('now').textContent = new Date().toLocaleString();
+
+      const grid = document.getElementById('config-grid');
+      const kv = [
+        ['Environment', data.environment],
+        ['NetBox token source', typeof data.netbox_token_source === 'string' ? data.netbox_token_source : 'secretsmanager:' + (data.netbox_token_source.secrets_manager_secret_name || '')],
+        ['SES role source', typeof data.ses_role_source === 'string' ? data.ses_role_source : 'ssm:' + (data.ses_role_source.ssm_param_name || '')],
+        ['Global allowlist', (data.global_allowlist || []).join(', ') || '(none)'],
+        ['Cache TTL (hours)', data.cache.ttl_hours],
+        ['Retention (days)', data.cache.retention_days],
+        ['Refresh hour (local)', data.schedules.refresh_hour],
+        ['Report hour (local)', data.schedules.report_hour],
+        ['Email from', data.email.from],
+        ['Email recipients', data.email.to_count]
+      ];
+
+      grid.innerHTML = kv.map(([k,v]) => `<div class="k">${k}</div><div>${fmt(v)}</div>`).join('');
+    }
+
+    async function loadStats(days) {
+      const res = await fetch(`admin/stats.json?days=${days}`, { headers: authHeaders() });
+      if (!res.ok) throw new Error('stats fetch failed');
+      const data = await res.json();
+      const hitsTbody = document.querySelector('#hits-table tbody');
+      const missesTbody = document.querySelector('#misses-table tbody');
+
+      hitsTbody.innerHTML = data.hits.map(row => `
+        <tr>
+          <td>${row.ip}</td>
+          <td>${fmt(row.hostname)}</td>
+          <td>${row.total}</td>
+          <td>${row.device_url ? `<a href="${row.device_url}" target="_blank">Open</a>` : ''}</td>
+        </tr>
+      `).join('');
+
+      missesTbody.innerHTML = data.misses.map(row => `
+        <tr><td>${row.ip}</td><td>${row.total}</td></tr>
+      `).join('');
+
+      document.getElementById('footer-days').textContent = days;
+    }
+
+    function authHeaders() {
+      const keyId = localStorage.getItem('ak_id') || '';
+      const key = localStorage.getItem('ak_token') || '';
+      const hdrs = {};
+      if (keyId) hdrs['X-API-Key-Id'] = keyId;
+      if (key) hdrs['X-API-Key'] = key;
+      return hdrs;
+    }
+
+    document.getElementById('apply').addEventListener('click', async () => {
+      const days = document.getElementById('days').value;
+      await loadStats(days);
+    });
+
+    document.getElementById('refresh-btn').addEventListener('click', async () => {
+      const note = document.getElementById('refresh-note');
+      note.textContent = 'Refreshing…';
+      const res = await fetch('admin/refresh', { method: 'POST', headers: authHeaders() });
+      note.textContent = res.ok ? 'Refresh kicked. Give it ~30s to hydrate.' : 'Refresh failed.';
+      setTimeout(() => (note.textContent = ''), 6000);
+    });
+
+    loadConfig().catch(console.error);
+    loadStats(7).catch(console.error);
+  </script>
+</body>
+</html>
