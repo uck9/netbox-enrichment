@@ -1,0 +1,15 @@
+[Unit]
+Description=NetBox Enrichment API
+After=network.target
+
+[Service]
+User=netbox
+WorkingDirectory=/opt/netbox-enrichment
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/netbox-enrichment/.env
+ExecStart=/opt/netbox-enrichment/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
