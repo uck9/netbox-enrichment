@@ -9,7 +9,7 @@ import time
 import secrets
 import base64
 import argparse
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional, Dict, Any, List
 
 import boto3
@@ -68,12 +68,28 @@ class Settings(BaseSettings):
     # Behavior toggles
     NETBOX_ONDEMAND_LOOKUP: bool = True          # set false to rely on nightly cache only
 
+    # TTLs (minutes)
+    SECRETS_CACHE_TTL_MIN: int = 360      # NetBox token from Secrets Manager
+    PARAMS_CACHE_TTL_MIN: int = 360       # SES role ARN from SSM
+    STS_CACHE_SAFETY_MIN: int = 5         # subtract this from STS expiration to refresh early
+
 settings = Settings()
 
 # ------------------------- AWS helpers -------------------------
 _boto = boto3.session.Session(region_name=settings.REGION)
 _ssm = _boto.client("ssm", config=BotoConfig(retries={"max_attempts": 3}))
 _secrets = _boto.client("secretsmanager", config=BotoConfig(retries={"max_attempts": 3}))
+
+# simple caches
+_netbox_token_cache = {"value": None, "exp": 0}     # Secrets Manager
+_ses_role_arn_cache = {"value": None, "exp": 0}     # SSM Parameter Store
+_ses_client_cache   = {"client": None, "exp": 0}    # STS creds -> SES client
+
+def _now() -> float:
+    return time.time()
+
+def _min_to_sec(m: int) -> int:
+    return max(0, int(m) * 60)
 
 def _clean_token(tok: str) -> str:
     t = (tok or "").strip().strip('"').strip("'")
@@ -82,33 +98,66 @@ def _clean_token(tok: str) -> str:
     return t
 
 def get_netbox_token() -> str:
+    # Dev: env var; cache not critical, but keep it simple
     if settings.APP_ENV.lower() == "development":
-        return _clean_token(settings.NETBOX_API_TOKEN or "")
-    # production: read from Secrets Manager, format "TOKEN:<value>"
+        tok = (settings.NETBOX_API_TOKEN or "").strip().strip('"').strip("'")
+        if not tok:
+            raise RuntimeError("NETBOX_API_TOKEN not set for development")
+        return tok
+
+    # Prod: Secrets Manager, cached
+    now = _now()
+    if _netbox_token_cache["value"] and _netbox_token_cache["exp"] > now:
+        return _netbox_token_cache["value"]
+
     secret_name = settings.NETBOX_API_TOKEN__SECRET_NAME
     if not secret_name:
         raise RuntimeError("NETBOX_API_TOKEN__SECRET_NAME not set for production")
+
     resp = _secrets.get_secret_value(SecretId=secret_name)
     s = resp.get("SecretString") or (resp.get("SecretBinary") and resp["SecretBinary"].decode())
     if not s or not s.startswith("TOKEN:"):
         raise RuntimeError("Secret format invalid. Expected 'TOKEN:<value>'")
-    return _clean_token(s.split(":", 1)[1])
+    tok = s.split(":", 1)[1].strip().strip('"').strip("'")
+    if not tok:
+        raise RuntimeError("Empty NetBox token after parsing")
+
+    _netbox_token_cache["value"] = tok
+    _netbox_token_cache["exp"] = now + _min_to_sec(settings.SECRETS_CACHE_TTL_MIN)
+    return tok
 
 def get_ses_role_arn() -> str:
     if settings.APP_ENV.lower() == "development":
-        if not settings.SES_ROLE_ARN:
+        arn = (settings.SES_ROLE_ARN or "").strip()
+        if not arn:
             raise RuntimeError("SES_ROLE_ARN not set for development")
-        return settings.SES_ROLE_ARN
+        return arn
+
+    now = _now()
+    if _ses_role_arn_cache["value"] and _ses_role_arn_cache["exp"] > now:
+        return _ses_role_arn_cache["value"]
+
     param_name = settings.SES_ROLE_ARN__PARAM_NAME
     if not param_name:
         raise RuntimeError("SES_ROLE_ARN__PARAM_NAME not set for production")
-    return _ssm.get_parameter(Name=param_name, WithDecryption=False)["Parameter"]["Value"]
+
+    arn = _ssm.get_parameter(Name=param_name, WithDecryption=False)["Parameter"]["Value"].strip()
+    _ses_role_arn_cache["value"] = arn
+    _ses_role_arn_cache["exp"] = now + _min_to_sec(settings.PARAMS_CACHE_TTL_MIN)
+    return arn
 
 def get_ses_client_assumed():
+    now = datetime.now(timezone.utc).timestamp()
+    if _ses_client_cache["client"] and _ses_client_cache["exp"] > now:
+        return _ses_client_cache["client"]
+
     arn = get_ses_role_arn()
     sts = _boto.client("sts")
-    creds = sts.assume_role(RoleArn=arn, RoleSessionName="netbox-enrich-sender")["Credentials"]
-    return boto3.client(
+    resp = sts.assume_role(RoleArn=arn, RoleSessionName="netbox-enrich-sender")
+    creds = resp["Credentials"]
+    exp_ts = creds["Expiration"].timestamp() - (settings.STS_CACHE_SAFETY_MIN * 60)
+
+    client = boto3.client(
         "ses",
         region_name=settings.REGION,
         aws_access_key_id=creds["AccessKeyId"],
@@ -116,6 +165,10 @@ def get_ses_client_assumed():
         aws_session_token=creds["SessionToken"],
         config=BotoConfig(retries={"max_attempts": 3}),
     )
+
+    _ses_client_cache["client"] = client
+    _ses_client_cache["exp"] = exp_ts
+    return client
 
 # ------------------------- DB init -------------------------
 def db():
@@ -192,6 +245,24 @@ init_db()
 # ------------------------- API Key helpers -------------------------
 def now_epoch() -> int:
     return int(time.time())
+
+def translate_criticality(code) -> str:
+    """
+    Accepts '01'..'04', '1'..'4', or None/'' and returns the display string.
+    """
+    if not code:
+        return ""
+    s = str(code).strip()
+    if not s:
+        return ""
+    s = s.lstrip("0") or "0"
+    mapping = {
+        "1": "1 - Critical",
+        "2": "2 - Important",
+        "3": "3 - Enabling",
+        "4": "4 - Best Effort",
+    }
+    return mapping.get(s, "")
 
 def create_api_key_record(key_id: str, raw_token: str, ttl_days: Optional[int], scopes: Optional[List[str]]):
     h = pbkdf2_sha256.hash(raw_token)
@@ -372,7 +443,7 @@ class NetBoxClient:
     def _strip_ip(self, ip_cidr: str) -> str:
         return str(ipaddress.ip_interface(ip_cidr).ip)
 
-    def list_active_with_primary_ipv4(self) -> List[Dict[str, Any]]:
+    def list_with_primary_ipv4(self) -> List[Dict[str, Any]]:
         url = f"{self.base}/api/dcim/devices/"
         params = {"has_primary_ip": "true", "limit": 200}
         results: List[Dict[str, Any]] = []
@@ -401,7 +472,7 @@ class NetBoxClient:
                     "role": (dev.get("role") or {}).get("name"),
                     "type": (dev.get("device_type") or {}).get("model"),
                     "tags": tags,
-                    "device_criticality": (cf.get("device_criticality") if isinstance(cf, dict) else None),
+                    "device_criticality": (cf.get("device_criticality_rating") if isinstance(cf, dict) else None),
                 })
             url = data.get("next")
         return results
@@ -460,7 +531,7 @@ class NetBoxClient:
             "role": (dev.get("role") or {}).get("name"),
             "type": (dev.get("device_type") or {}).get("model"),
             "tags": tags,
-            "device_criticality": (cf.get("device_criticality") if isinstance(cf, dict) else None),
+            "device_criticality": (cf.get("device_criticality_rating") if isinstance(cf, dict) else None),
         }
 
 def get_nb() -> NetBoxClient:
@@ -493,7 +564,7 @@ def prune_old_metrics():
     conn.commit(); conn.close()
 
 def cache_full_refresh(nb: NetBoxClient):
-    devices = nb.list_active_with_primary_ipv4()
+    devices = nb.list_with_primary_ipv4()
     now = _now_epoch()
     conn = db(); cur = conn.cursor()
     for d in devices:
@@ -674,16 +745,19 @@ app = FastAPI(title="NetBox Enrichment Service", lifespan=lifespan)
 router = APIRouter(prefix="/enrich")
 templates = Jinja2Templates(directory="templates")
 
+class DeviceData(BaseModel):
+    nb_name: str = ""
+    nb_status: str = ""
+    nb_url: str = ""
+    nb_site: str = ""
+    nb_location: str = ""
+    nb_role: str = ""
+    nb_type: str = ""
+    nb_tags: List[str] = Field(default_factory=list)
+    nb_criticality: str = ""   # translated value only (e.g., "1 - Critical")
+
 class EnrichResponse(BaseModel):
-    status: Optional[str] = ""
-    hostname: Optional[str] = ""
-    device_url: Optional[str] = ""
-    site: Optional[str] = ""
-    location: Optional[str] = ""
-    role: Optional[str] = ""
-    type: Optional[str] = ""
-    tags: List[str] = Field(default_factory=list)
-    custom_fields: Dict[str, Any] = Field(default_factory=dict)
+    device: DeviceData
 
 def normalize_ip(ip: str) -> str:
     try:
@@ -703,33 +777,37 @@ def enrich(ip: str = Query(...), authorized: bool = Depends(require_api_key)):
 
     if dev:
         record_hit(nip, miss=False)
-        dc = (dev.get("device_criticality") or "")  # may be None
-        cf = {"device_criticality": {"code": dc or "", "label": {"01":"Critical","02":"High","03":"Medium","04":"Low"}.get(dc, "")}}
+        crit = translate_criticality(dev.get("device_criticality"))
         return EnrichResponse(
-            status=(dev.get("status") or ""),
-            hostname=(dev.get("hostname") or ""),
-            device_url=(dev.get("device_url") or ""),
-            site=(dev.get("site") or ""),
-            location=(dev.get("location") or ""),
-            role=(dev.get("role") or ""),
-            type=(dev.get("type") or ""),
-            tags=(dev.get("tags") or []),
-            custom_fields=cf,
+            device=DeviceData(
+                nb_status=(dev.get("status") or ""),
+                nb_name=(dev.get("hostname") or ""),
+                nb_url=(dev.get("device_url") or ""),
+                nb_site=(dev.get("site") or ""),
+                nb_location=(dev.get("location") or ""),
+                nb_role=(dev.get("role") or ""),
+                nb_type=(dev.get("type") or ""),
+                nb_tags=(dev.get("tags") or []),
+                nb_criticality=crit,
+            )
         )
 
     # miss: cache miss recorded elsewhere; return blanks
-    record_hit(nip, miss=True)
-    return EnrichResponse(
-        status="",
-        hostname="",
-        device_url="",
-        site="",
-        location="",
-        role="",
-        type="",
-        tags=[],
-        custom_fields={"device_criticality": {"code": "", "label": ""}},
-    )
+    else:
+        record_hit(nip, miss=True)
+        return EnrichResponse(
+            device=DeviceData(
+                nb_name="",
+                nb_status="",
+                nb_url="",
+                nb_site="",
+                nb_location="",
+                nb_role="",
+                nb_type="",
+                nb_tags=[],
+                nb_criticality="",
+            )
+        )
 
 @router.get("/", include_in_schema=False)        # /enrich/
 def enrich_with_slash(request: Request, authorized: bool = Depends(require_api_key), ip: str = Query(...)):
